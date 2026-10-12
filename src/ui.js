@@ -569,6 +569,23 @@ export function renderDashboardHtml() {
       overflow: hidden;
       text-overflow: ellipsis;
     }
+    .log-row {
+      cursor: pointer;
+    }
+    .log-detail-row td {
+      background: var(--cream);
+      padding: 14px 20px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: var(--ink);
+      border-bottom: 1px solid var(--hairline-strong);
+    }
+    .log-detail-box {
+      display: grid;
+      gap: 6px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
 
     pre {
       margin: 0;
@@ -738,7 +755,10 @@ export function renderDashboardHtml() {
           <span class="index-tag">POOL</span>
           <h2 class="section-title">API Key Pool & Load Distribution</h2>
         </div>
-        <span class="mono muted" id="poolSummaryText" style="font-size:11.5px">0 keys configured</span>
+        <div class="controls">
+          <span class="mono muted" id="poolSummaryText" style="font-size:11.5px;margin-right:6px">0 keys configured</span>
+          <button class="btn-sm" onclick="exportKeys()">Export Keys</button>
+        </div>
       </div>
       <div class="table-wrap">
         <table>
@@ -768,6 +788,7 @@ export function renderDashboardHtml() {
         <div class="section-title-wrap">
           <span class="index-tag index-tag--muted">TELEMETRY</span>
           <h2 class="section-title">Recent MCP Call Logs</h2>
+          <span class="mono muted" style="font-size:11px">(Click row to expand)</span>
         </div>
         <div class="controls">
           <button class="btn-sm btn-danger" onclick="clearLogs()">Clear Logs</button>
@@ -812,6 +833,30 @@ export function renderDashboardHtml() {
 
   <script>
     let refreshTimer = null;
+    const expandedLogIds = new Set();
+
+    function toggleLogDetail(id) {
+      const row = document.getElementById('log-detail-' + id);
+      if (!row) return;
+      if (expandedLogIds.has(id)) {
+        expandedLogIds.delete(id);
+        row.style.display = 'none';
+      } else {
+        expandedLogIds.add(id);
+        row.style.display = 'table-row';
+      }
+    }
+
+    async function exportKeys() {
+      try {
+        const res = await apiFetch('/api/keys/export');
+        if (!res.text) return showToast('No keys to export');
+        await navigator.clipboard.writeText(res.text);
+        showToast('Copied ' + res.count + ' key(s) (label | key | quota) to clipboard');
+      } catch (e) {
+        showToast('Error: ' + e.message);
+      }
+    }
 
     function showToast(msg) {
       const el = document.getElementById('toast');
@@ -960,7 +1005,8 @@ export function renderDashboardHtml() {
         } else {
           lb.innerHTML = data.logs.map(l => {
             const c = Number(l.cost_usd || 0);
-            return '<tr>' +
+            const isOpen = expandedLogIds.has(l.id);
+            return '<tr class="log-row" onclick="toggleLogDetail(' + l.id + ')">' +
               '<td class="muted mono" title="' + esc(l.timestamp) + '">' + fmtTime(l.timestamp) + '</td>' +
               '<td><span class="badge badge-tool">' + esc(l.tool_name || l.method) + '</span></td>' +
               '<td class="query-cell" title="' + esc(l.query_preview || '') + '">' + esc(l.query_preview || '-') + '</td>' +
@@ -969,6 +1015,13 @@ export function renderDashboardHtml() {
               '<td class="mono">' + (c > 0 ? ('$' + c.toFixed(3)) : '-') + '</td>' +
               '<td class="mono">' + (l.latency_ms != null ? (l.latency_ms + ' ms') : '-') + '</td>' +
               '<td class="err-text" title="' + esc(l.error_message || '') + '">' + esc(l.error_message || '-') + '</td>' +
+            '</tr>' +
+            '<tr class="log-detail-row" id="log-detail-' + l.id + '" style="display:' + (isOpen ? 'table-row' : 'none') + '">' +
+              '<td colspan="8"><div class="log-detail-box">' +
+                '<div><strong>Log #' + l.id + '</strong> · ' + esc(l.timestamp) + ' · HTTP ' + esc(l.http_status) + ' · Key: ' + esc(l.key_label || '-') + ' (' + esc(l.masked_key || '-') + ')</div>' +
+                '<div><strong>Query / Payload:</strong> ' + esc(l.query_preview || '-') + '</div>' +
+                (l.error_message ? ('<div style="color:var(--accent-maroon-dark)"><strong>Note / Error:</strong> ' + esc(l.error_message) + '</div>') : '') +
+              '</div></td>' +
             '</tr>';
           }).join('');
         }

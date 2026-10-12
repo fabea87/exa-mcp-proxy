@@ -4,6 +4,7 @@ import { renderDashboardHtml } from "./ui.js";
 const DEFAULT_UPSTREAM = "https://mcp.exa.ai/mcp";
 const COOLDOWN_MS = 60_000;
 const MAX_LOGS = 200;
+const APP_VERSION = "1.3.0";
 
 function maskKey(key) {
   const clean = String(key || "").trim();
@@ -32,7 +33,7 @@ function buildMcpResponseHeaders(upstreamHeaders, extra = {}) {
     "vary",
   ];
   for (const name of safeForwardHeaders) {
-    const val = upstreamHeaders.get(name);
+    const val = upstreamHeaders?.get?.(name);
     if (val) headers.set(name, val);
   }
   for (const [k, v] of Object.entries(corsHeaders())) {
@@ -69,17 +70,34 @@ function extractClientProxyKey(request, url) {
   return "";
 }
 
-function checkAuth(request, url, env) {
+async function timingSafeCompare(a, b) {
+  const enc = new TextEncoder();
+  const [digestA, digestB] = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(String(a || ""))),
+    crypto.subtle.digest("SHA-256", enc.encode(String(b || ""))),
+  ]);
+  return crypto.subtle.timingSafeEqual(digestA, digestB);
+}
+
+async function checkAuth(request, url, env) {
   const expected = String(env.PROXY_API_KEY || "").trim();
   if (!expected) {
     return { ok: false, status: 500, error: "Server misconfigured: PROXY_API_KEY secret is not set." };
   }
   const provided = extractClientProxyKey(request, url);
-  if (!provided || provided !== expected) {
+  if (!provided) {
     return {
       ok: false,
       status: 401,
-      error: "Unauthorized: Invalid or missing Proxy API Key (use x-api-key or Authorization: Bearer <key>).",
+      error: "Unauthorized: Missing Proxy API Key (use x-api-key or Authorization: Bearer <key>).",
+    };
+  }
+  const match = await timingSafeCompare(provided, expected);
+  if (!match) {
+    return {
+      ok: false,
+      status: 401,
+      error: "Unauthorized: Invalid Proxy API Key.",
     };
   }
   return { ok: true };
@@ -109,14 +127,14 @@ function parseRpcPayload(bodyText) {
       return {
         method,
         toolName,
-        queryPreview: queryPreview.slice(0, 240),
+        queryPreview: queryPreview.slice(0, 1000),
         isToolCall: true,
       };
     }
     return {
       method,
       toolName: null,
-      queryPreview: primary.params ? JSON.stringify(primary.params).slice(0, 160) : null,
+      queryPreview: primary.params ? JSON.stringify(primary.params).slice(0, 300) : null,
       isToolCall: false,
     };
   } catch {
@@ -127,15 +145,12 @@ function parseRpcPayload(bodyText) {
 function extractExaCostUsd(bodyText) {
   if (!bodyText) return 0;
   const text = String(bodyText);
-  // 1. Check MCP _meta: "ai.exa/usage":{"costDollars":0.007}
   const metaMatch = text.match(/"ai\.exa\/usage"\s*:\s*\{\s*"costDollars"\s*:\s*([0-9]+(?:\.[0-9]+)?)/);
   if (metaMatch) return Number(metaMatch[1]) || 0;
 
-  // 2. Check advanced search costDollars object: "costDollars":{"total":0.012
   const totalMatch = text.match(/\\?"costDollars\\?"\s*:\s*\{\s*\\?"total\\?"\s*:\s*([0-9]+(?:\.[0-9]+)?)/);
   if (totalMatch) return Number(totalMatch[1]) || 0;
 
-  // 3. Check direct numeric costDollars
   const numMatch = text.match(/\\?"costDollars\\?"\s*:\s*([0-9]+(?:\.[0-9]+)?)/);
   if (numMatch) return Number(numMatch[1]) || 0;
 
@@ -155,7 +170,6 @@ function inspectExaResponse(httpStatus, bodyText) {
     return { keyFailure: "cooldown", reason: `HTTP 429: Exa API key rate limited` };
   }
 
-  // Exa MCP wraps tool errors inside HTTP 200 SSE `data: {"result":{"content":[{"type":"text","text":"..."}],"isError":true}}`
   const hasIsError = text.includes('"isError":true') || text.includes('"isError": true');
   if (hasIsError) {
     if (/error \((401|403)\)|invalid api key|unauthorized api key/i.test(text)) {
@@ -173,6 +187,180 @@ function inspectExaResponse(httpStatus, bodyText) {
   }
 
   return { keyFailure: null, reason: null };
+}
+
+/**
+ * Stateless Worker MCP handler: performs all network I/O outside the Durable Object
+ * while calling <1ms synchronous SQLite RPC methods on ExaProxyCoordinator.
+ */
+async function proxyMcpRequest(request, url, env, stub) {
+  const upstreamBase = env.UPSTREAM_MCP_URL || DEFAULT_UPSTREAM;
+  const upstreamUrl = new URL(upstreamBase);
+  for (const [k, v] of url.searchParams.entries()) {
+    if (k === "api_key" || k === "key") continue;
+    upstreamUrl.searchParams.set(k, v);
+  }
+
+  const method = request.method.toUpperCase();
+  const bodyText = method === "POST" || method === "PUT" ? await request.text() : "";
+  const rpcInfo = parseRpcPayload(bodyText);
+
+  const baseHeaders = new Headers();
+  const copyHeaderNames = [
+    "content-type",
+    "accept",
+    "mcp-session-id",
+    "mcp-protocol-version",
+    "last-event-id",
+  ];
+  for (const h of copyHeaderNames) {
+    const val = request.headers.get(h);
+    if (val) baseHeaders.set(h, val);
+  }
+  if (!baseHeaders.has("accept")) {
+    baseHeaders.set("Accept", "application/json, text/event-stream");
+  }
+  baseHeaders.set("User-Agent", "exa-mcp-client/1.0");
+
+  // Non-tool-call MCP requests (initialize, notifications/initialized, tools/list, resources/list, resources/read, prompts/list)
+  if (!rpcInfo.isToolCall) {
+    const peeked = await stub.rpcPeekKey();
+    if (peeked?.api_key) {
+      baseHeaders.set("x-api-key", peeked.api_key);
+    }
+    const resp = await fetch(upstreamUrl.toString(), {
+      method,
+      headers: baseHeaders,
+      body: method === "POST" || method === "PUT" ? bodyText : undefined,
+    });
+    const respText = await resp.text();
+    return new Response(respText, {
+      status: resp.status,
+      headers: buildMcpResponseHeaders(resp.headers),
+    });
+  }
+
+  // Tool call (`tools/call`) — load balance across healthy keys with automatic failover
+  const excludeIds = [];
+  const maxAttempts = 3;
+  let lastRespText = "";
+  let lastRespStatus = 502;
+  let lastUpstreamHeaders = new Headers();
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const selectedKey = await stub.rpcClaimKey(excludeIds, attempt === 1, rpcInfo);
+    if (!selectedKey) {
+      if (attempt === 1) {
+        return jsonResponse(
+          {
+            jsonrpc: "2.0",
+            id: null,
+            error: {
+              code: -32000,
+              message:
+                "Exa MCP Proxy Error: No active Exa API keys available in pool (or all keys reached quota). Add or enable keys in the WebUI.",
+            },
+          },
+          503
+        );
+      }
+      break;
+    }
+
+    const attemptHeaders = new Headers(baseHeaders);
+    attemptHeaders.set("x-api-key", selectedKey.api_key);
+    if (attempt > 1) {
+      attemptHeaders.delete("mcp-session-id");
+    }
+
+    const startMs = Date.now();
+    try {
+      const upstreamResp = await fetch(upstreamUrl.toString(), {
+        method,
+        headers: attemptHeaders,
+        body: bodyText,
+      });
+      const latencyMs = Date.now() - startMs;
+      const respText = await upstreamResp.text();
+      lastRespText = respText;
+      lastRespStatus = upstreamResp.status;
+      lastUpstreamHeaders = upstreamResp.headers;
+
+      const check = inspectExaResponse(upstreamResp.status, respText);
+      if (check.keyFailure) {
+        await stub.rpcRecordOutcome({
+          ok: false,
+          keyId: selectedKey.id,
+          keyLabel: selectedKey.label,
+          maskedKey: selectedKey.masked_key,
+          failureType: check.keyFailure,
+          reason: check.reason,
+          isFailover: true,
+          method: rpcInfo.method,
+          toolName: rpcInfo.toolName,
+          queryPreview: rpcInfo.queryPreview,
+          httpStatus: upstreamResp.status,
+          latencyMs,
+        });
+        excludeIds.push(Number(selectedKey.id));
+        continue;
+      }
+
+      const costUsd = extractExaCostUsd(respText);
+      await stub.rpcRecordOutcome({
+        ok: true,
+        keyId: selectedKey.id,
+        keyLabel: selectedKey.label,
+        maskedKey: selectedKey.masked_key,
+        costUsd,
+        method: rpcInfo.method,
+        toolName: rpcInfo.toolName,
+        queryPreview: rpcInfo.queryPreview,
+        httpStatus: upstreamResp.status,
+        latencyMs,
+        attempt,
+      });
+
+      return new Response(respText, {
+        status: upstreamResp.status,
+        headers: buildMcpResponseHeaders(upstreamResp.headers, {
+          "X-Exa-Proxy-Key-Id": selectedKey.id,
+          "X-Exa-Proxy-Key-Label": selectedKey.label,
+          "X-Exa-Proxy-Cost-Usd": costUsd,
+        }),
+      });
+    } catch (err) {
+      const latencyMs = Date.now() - startMs;
+      await stub.rpcRecordOutcome({
+        ok: false,
+        keyId: selectedKey.id,
+        keyLabel: selectedKey.label,
+        maskedKey: selectedKey.masked_key,
+        failureType: "network",
+        reason: err.message,
+        isFailover: false,
+        method: rpcInfo.method,
+        toolName: rpcInfo.toolName,
+        queryPreview: rpcInfo.queryPreview,
+        httpStatus: 502,
+        latencyMs,
+      });
+      excludeIds.push(Number(selectedKey.id));
+    }
+  }
+
+  return new Response(
+    lastRespText ||
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32000, message: "All Exa API key attempts failed." },
+      }),
+    {
+      status: lastRespStatus,
+      headers: buildMcpResponseHeaders(lastUpstreamHeaders),
+    }
+  );
 }
 
 export class ExaProxyCoordinator extends DurableObject {
@@ -224,7 +412,6 @@ export class ExaProxyCoordinator extends DurableObject {
       );
     `);
 
-    // Safe schema migrations for existing SQLite tables
     try {
       this.sql.exec("ALTER TABLE api_keys ADD COLUMN total_cost_usd REAL NOT NULL DEFAULT 0");
     } catch {}
@@ -235,7 +422,6 @@ export class ExaProxyCoordinator extends DurableObject {
       this.sql.exec("ALTER TABLE call_logs ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0");
     } catch {}
 
-    // Backfill total_cost_usd for existing successful calls if 0
     this.sql.exec(
       "UPDATE api_keys SET total_cost_usd = ROUND(success_calls * 0.007, 4) WHERE total_cost_usd = 0 AND success_calls > 0"
     );
@@ -265,6 +451,80 @@ export class ExaProxyCoordinator extends DurableObject {
     const next = cur + delta;
     this.setSetting(key, String(next));
     return next;
+  }
+
+  /**
+   * Synchronous RPC: Peek an active key for non-tool-call MCP handshakes.
+   */
+  rpcPeekKey() {
+    this.incrementCounter("total_requests", 1);
+    return this.peekHealthyKey();
+  }
+
+  /**
+   * Synchronous RPC: Claim the next healthy key for a tool call (<1ms SQLite).
+   */
+  rpcClaimKey(excludeIds = [], isFirstAttempt = true, rpcInfo = {}) {
+    if (isFirstAttempt) {
+      this.incrementCounter("total_requests", 1);
+      this.incrementCounter("total_tool_calls", 1);
+    }
+    const chosen = this.selectHealthyKey(excludeIds);
+    if (!chosen && isFirstAttempt) {
+      this.appendCallLog({
+        method: rpcInfo.method || "tools/call",
+        toolName: rpcInfo.toolName || null,
+        queryPreview: rpcInfo.queryPreview || null,
+        status: "error",
+        httpStatus: 503,
+        latencyMs: 0,
+        costUsd: 0,
+        errorMessage: "No active Exa API keys available in proxy pool",
+      });
+    }
+    return chosen;
+  }
+
+  /**
+   * Synchronous RPC: Record outcome of a tool call (<1ms SQLite).
+   */
+  rpcRecordOutcome(outcome) {
+    if (outcome.ok) {
+      this.recordKeySuccess(outcome.keyId, outcome.costUsd);
+      this.appendCallLog({
+        method: outcome.method,
+        toolName: outcome.toolName,
+        queryPreview: outcome.queryPreview,
+        keyId: outcome.keyId,
+        keyLabel: outcome.keyLabel,
+        maskedKey: outcome.maskedKey,
+        status: "ok",
+        httpStatus: outcome.httpStatus,
+        latencyMs: outcome.latencyMs,
+        costUsd: outcome.costUsd,
+        errorMessage: outcome.attempt > 1 ? `Recovered on attempt #${outcome.attempt}` : null,
+      });
+    } else {
+      this.recordKeyFailure(outcome.keyId, outcome.failureType, outcome.reason, true);
+      if (outcome.isFailover) {
+        this.incrementCounter("total_failovers", 1);
+      }
+      this.appendCallLog({
+        method: outcome.method,
+        toolName: outcome.toolName,
+        queryPreview: outcome.queryPreview,
+        keyId: outcome.keyId,
+        keyLabel: outcome.keyLabel,
+        maskedKey: outcome.maskedKey,
+        status: outcome.isFailover ? "retried" : "error",
+        httpStatus: outcome.httpStatus,
+        latencyMs: outcome.latencyMs,
+        costUsd: 0,
+        errorMessage: outcome.isFailover
+          ? `Failover (${outcome.failureType}): ${outcome.reason}`
+          : outcome.reason,
+      });
+    }
   }
 
   importRawKeys(rawText, defaultQuotaUsd = 10.0) {
@@ -324,12 +584,25 @@ export class ExaProxyCoordinator extends DurableObject {
     return added;
   }
 
-  peekHealthyKey() {
+  refreshKeyStates() {
     const now = Date.now();
+    // 1. Recover expired cooldowns
     this.sql.exec(
       "UPDATE api_keys SET status = 'active', cooldown_until = 0 WHERE status = 'cooldown' AND cooldown_until <= ?",
       now
     );
+    // 2. Proactive quota cutoff: mark keys whose tracked spend reached their configured quota_usd
+    this.sql.exec(
+      `UPDATE api_keys
+       SET status = 'exhausted',
+           enabled = 0,
+           last_error = 'Configured quota reached (' || ROUND(total_cost_usd, 3) || ' / $' || ROUND(quota_usd, 2) || ')'
+       WHERE enabled = 1 AND quota_usd > 0 AND total_cost_usd >= quota_usd`
+    );
+  }
+
+  peekHealthyKey() {
+    this.refreshKeyStates();
     const rows = this.sql
       .exec("SELECT * FROM api_keys WHERE enabled = 1 AND status = 'active' ORDER BY id ASC LIMIT 1")
       .toArray();
@@ -337,11 +610,7 @@ export class ExaProxyCoordinator extends DurableObject {
   }
 
   selectHealthyKey(excludeIds = []) {
-    const now = Date.now();
-    this.sql.exec(
-      "UPDATE api_keys SET status = 'active', cooldown_until = 0 WHERE status = 'cooldown' AND cooldown_until <= ?",
-      now
-    );
+    this.refreshKeyStates();
 
     const strategy = this.getSetting("strategy", "least_used");
     const allEligible = this.sql
@@ -361,7 +630,6 @@ export class ExaProxyCoordinator extends DurableObject {
       chosen = allEligible[rrIndex % allEligible.length];
       this.setSetting("rr_index", String((rrIndex + 1) % Math.max(1, allEligible.length)));
     } else {
-      // least_used: lowest total_calls, then oldest last_used_at, then lowest id
       allEligible.sort((a, b) => {
         const ca = Number(a.total_calls) || 0;
         const cb = Number(b.total_calls) || 0;
@@ -374,7 +642,6 @@ export class ExaProxyCoordinator extends DurableObject {
       chosen = allEligible[0];
     }
 
-    // Pre-claim key synchronously in SQLite so concurrent requests spread evenly across keys
     const nowIso = new Date().toISOString();
     this.sql.exec(
       "UPDATE api_keys SET total_calls = total_calls + 1, last_used_at = ? WHERE id = ?",
@@ -398,6 +665,7 @@ export class ExaProxyCoordinator extends DurableObject {
       now,
       keyId
     );
+    this.refreshKeyStates();
   }
 
   recordKeyFailure(keyId, failureType, reason, preClaimed = true) {
@@ -469,7 +737,7 @@ export class ExaProxyCoordinator extends DurableObject {
       entry.httpStatus ?? 200,
       entry.latencyMs ?? 0,
       Number(entry.costUsd) || 0,
-      entry.errorMessage ? String(entry.errorMessage).slice(0, 300) : null
+      entry.errorMessage ? String(entry.errorMessage).slice(0, 500) : null
     );
 
     this.sql.exec(
@@ -488,6 +756,7 @@ export class ExaProxyCoordinator extends DurableObject {
         headers: {
           "Content-Type": "application/json",
           Accept: "application/json, text/event-stream",
+          "User-Agent": "exa-mcp-client/1.0",
           "x-api-key": keyRow.api_key,
         },
         body: JSON.stringify({
@@ -525,6 +794,7 @@ export class ExaProxyCoordinator extends DurableObject {
         new Date().toISOString(),
         keyRow.id
       );
+      this.refreshKeyStates();
       return { id: keyRow.id, label: keyRow.label, ok: true, latencyMs, costUsd };
     } catch (err) {
       const latencyMs = Date.now() - start;
@@ -532,202 +802,12 @@ export class ExaProxyCoordinator extends DurableObject {
     }
   }
 
-  async handleMcpProxy(request, url) {
-    this.incrementCounter("total_requests", 1);
-
-    const upstreamBase = this.env.UPSTREAM_MCP_URL || DEFAULT_UPSTREAM;
-    const upstreamUrl = new URL(upstreamBase);
-    for (const [k, v] of url.searchParams.entries()) {
-      if (k === "api_key" || k === "key") continue;
-      upstreamUrl.searchParams.set(k, v);
-    }
-
-    const method = request.method.toUpperCase();
-    const bodyText = method === "POST" || method === "PUT" ? await request.text() : "";
-    const rpcInfo = parseRpcPayload(bodyText);
-
-    const baseHeaders = new Headers();
-    const copyHeaderNames = [
-      "content-type",
-      "accept",
-      "mcp-session-id",
-      "mcp-protocol-version",
-      "last-event-id",
-    ];
-    for (const h of copyHeaderNames) {
-      const val = request.headers.get(h);
-      if (val) baseHeaders.set(h, val);
-    }
-    if (!baseHeaders.has("accept")) {
-      baseHeaders.set("Accept", "application/json, text/event-stream");
-    }
-    baseHeaders.set("User-Agent", "exa-mcp-client/1.0");
-
-    // Non-tool-call MCP requests (initialize, notifications/initialized, tools/list, resources/list, resources/read, prompts/list, GET/DELETE)
-    if (!rpcInfo.isToolCall) {
-      const peeked = this.peekHealthyKey();
-      if (peeked) {
-        baseHeaders.set("x-api-key", peeked.api_key);
-      }
-      const resp = await fetch(upstreamUrl.toString(), {
-        method,
-        headers: baseHeaders,
-        body: method === "POST" || method === "PUT" ? bodyText : undefined,
-      });
-      const respText = await resp.text();
-      return new Response(respText, {
-        status: resp.status,
-        headers: buildMcpResponseHeaders(resp.headers),
-      });
-    }
-
-    // Tool call (`tools/call`) — load balance across healthy keys with automatic failover
-    this.incrementCounter("total_tool_calls", 1);
-    const excludeIds = [];
-    const maxAttempts = 3;
-    let lastRespText = "";
-    let lastRespStatus = 502;
-    let lastUpstreamHeaders = new Headers();
-
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      const selectedKey = this.selectHealthyKey(excludeIds);
-      if (!selectedKey) {
-        if (attempt === 1) {
-          this.appendCallLog({
-            method: rpcInfo.method,
-            toolName: rpcInfo.toolName,
-            queryPreview: rpcInfo.queryPreview,
-            status: "error",
-            httpStatus: 503,
-            latencyMs: 0,
-            costUsd: 0,
-            errorMessage: "No active Exa API keys available in proxy pool",
-          });
-          return jsonResponse(
-            {
-              jsonrpc: "2.0",
-              id: null,
-              error: {
-                code: -32000,
-                message:
-                  "Exa MCP Proxy Error: No active Exa API keys available in pool. Add or enable keys in the WebUI.",
-              },
-            },
-            503
-          );
-        }
-        break;
-      }
-
-      const attemptHeaders = new Headers(baseHeaders);
-      attemptHeaders.set("x-api-key", selectedKey.api_key);
-      if (attempt > 1) {
-        attemptHeaders.delete("mcp-session-id");
-      }
-
-      const startMs = Date.now();
-      try {
-        const upstreamResp = await fetch(upstreamUrl.toString(), {
-          method,
-          headers: attemptHeaders,
-          body: bodyText,
-        });
-        const latencyMs = Date.now() - startMs;
-        const respText = await upstreamResp.text();
-        lastRespText = respText;
-        lastRespStatus = upstreamResp.status;
-        lastUpstreamHeaders = upstreamResp.headers;
-
-        const check = inspectExaResponse(upstreamResp.status, respText);
-        if (check.keyFailure) {
-          this.recordKeyFailure(selectedKey.id, check.keyFailure, check.reason, true);
-          this.incrementCounter("total_failovers", 1);
-          this.appendCallLog({
-            method: rpcInfo.method,
-            toolName: rpcInfo.toolName,
-            queryPreview: rpcInfo.queryPreview,
-            keyId: selectedKey.id,
-            keyLabel: selectedKey.label,
-            maskedKey: selectedKey.masked_key,
-            status: "retried",
-            httpStatus: upstreamResp.status,
-            latencyMs,
-            costUsd: 0,
-            errorMessage: `Failover (${check.keyFailure}): ${check.reason}`,
-          });
-          excludeIds.push(Number(selectedKey.id));
-          continue;
-        }
-
-        // Healthy response — extract real-time USD cost reported by Exa MCP (`_meta["ai.exa/usage"].costDollars`)
-        const costUsd = extractExaCostUsd(respText);
-        this.recordKeySuccess(selectedKey.id, costUsd);
-        this.appendCallLog({
-          method: rpcInfo.method,
-          toolName: rpcInfo.toolName,
-          queryPreview: rpcInfo.queryPreview,
-          keyId: selectedKey.id,
-          keyLabel: selectedKey.label,
-          maskedKey: selectedKey.masked_key,
-          status: "ok",
-          httpStatus: upstreamResp.status,
-          latencyMs,
-          costUsd,
-          errorMessage: attempt > 1 ? `Recovered on attempt #${attempt}` : null,
-        });
-
-        return new Response(respText, {
-          status: upstreamResp.status,
-          headers: buildMcpResponseHeaders(upstreamResp.headers, {
-            "X-Exa-Proxy-Key-Id": selectedKey.id,
-            "X-Exa-Proxy-Key-Label": selectedKey.label,
-            "X-Exa-Proxy-Cost-Usd": costUsd,
-          }),
-        });
-      } catch (err) {
-        const latencyMs = Date.now() - startMs;
-        this.recordKeyFailure(selectedKey.id, "network", err.message, true);
-        this.appendCallLog({
-          method: rpcInfo.method,
-          toolName: rpcInfo.toolName,
-          queryPreview: rpcInfo.queryPreview,
-          keyId: selectedKey.id,
-          keyLabel: selectedKey.label,
-          maskedKey: selectedKey.masked_key,
-          status: "error",
-          httpStatus: 502,
-          latencyMs,
-          costUsd: 0,
-          errorMessage: err.message,
-        });
-        excludeIds.push(Number(selectedKey.id));
-      }
-    }
-
-    return new Response(
-      lastRespText ||
-        JSON.stringify({
-          jsonrpc: "2.0",
-          id: null,
-          error: { code: -32000, message: "All Exa API key attempts failed." },
-        }),
-      {
-        status: lastRespStatus,
-        headers: buildMcpResponseHeaders(lastUpstreamHeaders),
-      }
-    );
-  }
-
   async handleApi(request, url) {
     const path = url.pathname;
     const method = request.method.toUpperCase();
 
     if (path === "/api/overview" && method === "GET") {
-      const now = Date.now();
-      this.sql.exec(
-        "UPDATE api_keys SET status = 'active', cooldown_until = 0 WHERE status = 'cooldown' AND cooldown_until <= ?",
-        now
-      );
+      this.refreshKeyStates();
 
       const keys = this.sql
         .exec(
@@ -763,7 +843,7 @@ export class ExaProxyCoordinator extends DurableObject {
         totalSucc + totalErr > 0 ? Math.round((totalSucc / (totalSucc + totalErr)) * 1000) / 10 : 100;
 
       return jsonResponse({
-        version: "1.2.0",
+        version: APP_VERSION,
         stats: {
           strategy,
           totalKeys,
@@ -779,6 +859,14 @@ export class ExaProxyCoordinator extends DurableObject {
         keys,
         logs,
       });
+    }
+
+    if (path === "/api/keys/export" && method === "GET") {
+      const rows = this.sql
+        .exec("SELECT label, api_key, quota_usd FROM api_keys ORDER BY id ASC")
+        .toArray();
+      const text = rows.map((r) => `${r.label} | ${r.api_key} | ${r.quota_usd ?? 10}`).join("\n");
+      return jsonResponse({ ok: true, count: rows.length, text });
     }
 
     if (path === "/api/keys" && method === "POST") {
@@ -833,6 +921,7 @@ export class ExaProxyCoordinator extends DurableObject {
         }
         if (typeof body.quotaUsd === "number" && body.quotaUsd > 0) {
           this.sql.exec("UPDATE api_keys SET quota_usd = ? WHERE id = ?", body.quotaUsd, id);
+          this.refreshKeyStates();
         }
         if (typeof body.status === "string") {
           this.sql.exec("UPDATE api_keys SET status = ?, cooldown_until = 0 WHERE id = ?", body.status, id);
@@ -867,9 +956,6 @@ export class ExaProxyCoordinator extends DurableObject {
 
   async fetch(request) {
     const url = new URL(request.url);
-    if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {
-      return this.handleMcpProxy(request, url);
-    }
     if (url.pathname.startsWith("/api/")) {
       return this.handleApi(request, url);
     }
@@ -895,17 +981,22 @@ export default {
 
     // Health check endpoint
     if (url.pathname === "/health") {
-      return jsonResponse({ ok: true, service: "exa-mcp-proxy", version: "1.2.0" });
+      return jsonResponse({ ok: true, service: "exa-mcp-proxy", version: APP_VERSION });
     }
 
-    // All /mcp and /api/* routes require PROXY_API_KEY verification
+    // All /mcp and /api/* routes require constant-time PROXY_API_KEY verification
     if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/") || url.pathname.startsWith("/api/")) {
-      const auth = checkAuth(request, url, env);
+      const auth = await checkAuth(request, url, env);
       if (!auth.ok) {
         return jsonResponse({ error: auth.error }, auth.status);
       }
       const id = env.COORDINATOR.idFromName("global");
       const stub = env.COORDINATOR.get(id);
+
+      // Perform network-bound MCP proxying in the stateless Worker using <1ms DO RPCs
+      if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {
+        return proxyMcpRequest(request, url, env, stub);
+      }
       return stub.fetch(request);
     }
 
