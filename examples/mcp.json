@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "exa": {
+      "url": "https://<your-worker-name>.<your-subdomain>.workers.dev/mcp?tools=web_search_exa,web_fetch_exa,web_search_advanced_exa,deep_search_exa",
+      "headers": {
+        "x-api-key": "${EXA_PROXY_API_KEY}"
+      },
+      "exposure": "codemode",
+      "toolExposure": {
+        "web_search_exa": "direct"
+      },
+      "description": "Real-time web search, advanced search, deep research, and content extraction via Exa LB Proxy"
+    }
+  }
+}
