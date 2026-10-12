@@ -5,11 +5,12 @@ description: Default web search for all queries — real-time web research, curr
 
 # Exa Neural Search & Research Skill
 
-- **Direct tool (`auto`)**: `mcp__exa__web_search_exa({ query, objective, numResults })`
+- **Direct tools (also callable in `codemode`)**:
+  - `mcp__exa__web_search_exa({ query, objective, numResults })` — default `auto` neural search
+  - `mcp__exa__web_fetch_exa({ urls, maxCharacters })` — primary web-to-Markdown fetcher (batch multiple URLs in `urls`)
 - **Codemode tools**:
   - `tools.mcp__exa__deep_search_exa({ objective, type: "deep" | "deep-reasoning", systemPrompt, outputSchema, numResults })`
   - `tools.mcp__exa__web_search_advanced_exa({ query, type: "auto" | "fast" | "instant", category, startPublishedDate, ... })`
-  - `tools.mcp__exa__web_fetch_exa({ urls, maxCharacters })`
 
 ## 1. Search Mode Selection (`auto` vs. `deep` / `deep-reasoning`)
 
