@@ -4,7 +4,7 @@ import { renderDashboardHtml } from "./ui.js";
 const DEFAULT_UPSTREAM = "https://mcp.exa.ai/mcp";
 const COOLDOWN_MS = 60_000;
 const MAX_LOGS = 200;
-const APP_VERSION = "1.4.0";
+const APP_VERSION = "1.5.0";
 
 function maskKey(key) {
   const clean = String(key || "").trim();
@@ -319,7 +319,7 @@ async function proxyMcpRequest(request, url, env, stub) {
     baseHeaders.set("Accept", "application/json, text/event-stream");
   }
   if (!baseHeaders.has("x-exa-source")) {
-    baseHeaders.set("x-exa-source", "exa-mcp-proxy/1.4.0");
+    baseHeaders.set("x-exa-source", "exa-mcp-proxy/1.5.0");
   }
   baseHeaders.set("User-Agent", "exa-mcp-client/1.0");
 

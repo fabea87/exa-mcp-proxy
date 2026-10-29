@@ -529,6 +529,82 @@ export function renderDashboardHtml() {
     .badge-tool::before {
       display: none;
     }
+    .badge-tool--agent {
+      background: #f3e8ff;
+      color: #6b21a8;
+      border: 1px solid #d8b4fe;
+    }
+    .badge-tool--fetch {
+      background: #ecfdf5;
+      color: #065f46;
+      border: 1px solid #a7f3d0;
+    }
+    .badge-tool--search {
+      background: var(--brand-fainter);
+      color: var(--brand-logo);
+      border: 1px solid var(--brand-faint);
+    }
+    .badge-tool--adv {
+      background: #fef3c7;
+      color: #92400e;
+      border: 1px solid #fde68a;
+    }
+
+    .filter-pills {
+      display: inline-flex;
+      gap: 5px;
+      align-items: center;
+      margin-left: 12px;
+    }
+    .pill {
+      font-size: 11px;
+      padding: 3px 9px;
+      border-radius: 999px;
+      border: 1px solid var(--hairline-strong);
+      background: var(--white);
+      color: var(--ink);
+      cursor: pointer;
+      font-family: var(--font-mono);
+      transition: all 0.15s ease;
+    }
+    .pill:hover {
+      background: var(--cream-darker);
+    }
+    .pill.active {
+      background: var(--ink);
+      color: var(--white);
+      border-color: var(--ink);
+    }
+
+    .tab-bar {
+      display: flex;
+      gap: 2px;
+      border-bottom: 1px solid var(--hairline);
+      padding: 0 16px;
+      background: var(--cream-darker);
+    }
+    .tab-btn {
+      padding: 9px 14px;
+      font-size: 12px;
+      font-family: var(--font-mono);
+      background: transparent;
+      border: none;
+      border-bottom: 2px solid transparent;
+      color: var(--greige-light);
+      cursor: pointer;
+      border-radius: 0;
+      transition: all 0.15s ease;
+    }
+    .tab-btn:hover {
+      color: var(--ink);
+      background: transparent;
+    }
+    .tab-btn.active {
+      color: var(--brand-logo);
+      border-bottom-color: var(--brand-logo);
+      font-weight: 600;
+      background: transparent;
+    }
 
     /* Progress Bar */
     .bar-wrap {
@@ -627,7 +703,7 @@ export function renderDashboardHtml() {
           <path d="M285.673 62.9573L325.127 112.948C325.726 113.707 325.183 114.82 324.213 114.82H305.929C305.572 114.82 305.235 114.657 305.015 114.378L275.053 76.414L245.093 114.378C244.872 114.657 244.536 114.82 244.179 114.82H225.893C224.924 114.82 224.381 113.707 224.98 112.948L264.433 62.9573L227.177 15.7512C226.578 14.9921 227.121 13.8793 228.091 13.8793H246.375C246.732 13.8793 247.068 14.0423 247.289 14.3214L275.053 49.5006L302.818 14.3214C303.038 14.0423 303.375 13.8793 303.731 13.8793H322.016C322.985 13.8793 323.528 14.9921 322.929 15.7512L285.673 62.9573Z" fill="#101321"/>
         </svg>
         <div class="brand-divider"></div>
-        <span class="index-tag">MCP PROXY // POOL</span>
+        <span class="index-tag">MCP PROXY // POOL v1.5.0</span>
         <span id="connBadge" class="badge badge-disabled">Connecting</span>
       </div>
       <div class="controls">
@@ -788,7 +864,13 @@ export function renderDashboardHtml() {
         <div class="section-title-wrap">
           <span class="index-tag index-tag--muted">TELEMETRY</span>
           <h2 class="section-title">Recent MCP Call Logs</h2>
-          <span class="mono muted" style="font-size:11px">(Click row to expand)</span>
+          <div class="filter-pills" id="logFilterPills">
+            <button class="pill active" data-filter="all" onclick="setLogFilter('all')">All</button>
+            <button class="pill" data-filter="agent_run" onclick="setLogFilter('agent_run')">agent_run</button>
+            <button class="pill" data-filter="search" onclick="setLogFilter('search')">search</button>
+            <button class="pill" data-filter="fetch" onclick="setLogFilter('fetch')">fetch</button>
+            <button class="pill" data-filter="error" onclick="setLogFilter('error')">Errors</button>
+          </div>
         </div>
         <div class="controls">
           <button class="btn-sm btn-danger" onclick="clearLogs()">Clear Logs</button>
@@ -819,9 +901,14 @@ export function renderDashboardHtml() {
       <div class="section-header">
         <div class="section-title-wrap">
           <span class="index-tag index-tag--muted">CONFIG</span>
-          <h2 class="section-title">Pi <code>~/.pi/agent/mcp.json</code> Integration</h2>
+          <h2 class="section-title">Client MCP Configuration</h2>
         </div>
-        <button class="btn-sm btn-primary" onclick="copyMcpConfig()">Copy JSON</button>
+        <button class="btn-sm btn-primary" onclick="copyMcpConfig()">Copy Config</button>
+      </div>
+      <div class="tab-bar">
+        <button class="tab-btn active" id="tab-pi" onclick="setClientTab('pi')">Pi Coding Agent</button>
+        <button class="tab-btn" id="tab-claude" onclick="setClientTab('claude')">Claude Desktop / Code</button>
+        <button class="tab-btn" id="tab-cursor" onclick="setClientTab('cursor')">Cursor</button>
       </div>
       <div class="section-body">
         <pre id="mcpConfigPre"></pre>
@@ -834,6 +921,17 @@ export function renderDashboardHtml() {
   <script>
     let refreshTimer = null;
     const expandedLogIds = new Set();
+    let currentClientTab = 'pi';
+    let currentRawLogs = [];
+    let currentLogFilter = 'all';
+
+    function setClientTab(tab) {
+      currentClientTab = tab;
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      const activeBtn = document.getElementById('tab-' + tab);
+      if (activeBtn) activeBtn.classList.add('active');
+      renderMcpSnippet();
+    }
 
     function toggleLogDetail(id) {
       const row = document.getElementById('log-detail-' + id);
@@ -880,23 +978,122 @@ export function renderDashboardHtml() {
 
     function renderMcpSnippet() {
       const origin = window.location.origin;
-      const snippet = {
-        mcpServers: {
-          exa: {
-            url: origin + "/mcp?tools=web_search_exa,web_fetch_exa,web_search_advanced_exa,agent_run",
-            headers: {
-              "x-api-key": getProxyKey() || "\${EXA_PROXY_API_KEY}"
-            },
-            exposure: "codemode",
-            toolExposure: {
-              web_search_exa: "direct",
-              web_fetch_exa: "direct"
-            },
-            description: "Real-time web search, content extraction, advanced search, and autonomous multi-step research via Exa LB Proxy"
+      const proxyKey = getProxyKey() || "${EXA_PROXY_API_KEY}";
+      const mcpUrl = origin + "/mcp?tools=web_search_exa,web_fetch_exa,web_search_advanced_exa,agent_run";
+
+      let snippet;
+      if (currentClientTab === 'claude') {
+        snippet = {
+          mcpServers: {
+            exa: {
+              url: mcpUrl,
+              headers: {
+                "x-api-key": proxyKey
+              }
+            }
           }
-        }
-      };
+        };
+      } else if (currentClientTab === 'cursor') {
+        snippet = {
+          mcpServers: {
+            exa: {
+              url: mcpUrl,
+              headers: {
+                "x-api-key": proxyKey
+              }
+            }
+          }
+        };
+      } else {
+        // Pi coding agent with hybrid codemode + direct exposure
+        snippet = {
+          mcpServers: {
+            exa: {
+              url: mcpUrl,
+              headers: {
+                "x-api-key": proxyKey
+              },
+              exposure: "codemode",
+              toolExposure: {
+                "web_search_exa": "direct",
+                "web_fetch_exa": "direct"
+              },
+              description: "Real-time web search, content extraction, advanced search, and autonomous multi-step research via Exa LB Proxy"
+            }
+          }
+        };
+      }
       document.getElementById('mcpConfigPre').textContent = JSON.stringify(snippet, null, 2);
+    }
+
+    function copyMcpConfig() {
+      const text = document.getElementById('mcpConfigPre').textContent;
+      if (!text) return;
+      navigator.clipboard.writeText(text);
+      const label = currentClientTab === 'pi' ? 'Pi' : (currentClientTab === 'claude' ? 'Claude' : 'Cursor');
+      showToast('Copied ' + label + ' MCP config');
+    }
+
+    function toolBadge(toolName, method) {
+      const name = toolName || method || 'unknown';
+      let extraClass = '';
+      if (name === 'agent_run') extraClass = ' badge-tool--agent';
+      else if (name === 'web_fetch_exa' || name === 'crawling_exa') extraClass = ' badge-tool--fetch';
+      else if (name === 'web_search_exa') extraClass = ' badge-tool--search';
+      else if (name === 'web_search_advanced_exa' || name === 'deep_search_exa') extraClass = ' badge-tool--adv';
+      return '<span class="badge badge-tool' + extraClass + '">' + esc(name) + '</span>';
+    }
+
+    function setLogFilter(filter) {
+      currentLogFilter = filter;
+      document.querySelectorAll('#logFilterPills .pill').forEach(p => {
+        p.classList.toggle('active', p.getAttribute('data-filter') === filter);
+      });
+      renderLogs();
+    }
+
+    function renderLogs() {
+      const lb = document.getElementById('logsTableBody');
+      if (!currentRawLogs || !currentRawLogs.length) {
+        lb.innerHTML = '<tr><td colspan="8" class="muted" style="text-align:center;padding:28px">No tool calls recorded yet.</td></tr>';
+        return;
+      }
+
+      const filtered = currentRawLogs.filter(l => {
+        if (currentLogFilter === 'all') return true;
+        if (currentLogFilter === 'agent_run') return l.tool_name === 'agent_run';
+        if (currentLogFilter === 'search') return l.tool_name === 'web_search_exa' || l.tool_name === 'web_search_advanced_exa';
+        if (currentLogFilter === 'fetch') return l.tool_name === 'web_fetch_exa' || l.tool_name === 'crawling_exa';
+        if (currentLogFilter === 'error') return l.status !== 'ok';
+        return true;
+      });
+
+      if (!filtered.length) {
+        lb.innerHTML = '<tr><td colspan="8" class="muted" style="text-align:center;padding:24px">No logs matching filter "' + esc(currentLogFilter) + '".</td></tr>';
+        return;
+      }
+
+      lb.innerHTML = filtered.map(l => {
+        const c = Number(l.cost_usd || 0);
+        const isOpen = expandedLogIds.has(l.id);
+        return '<tr class="log-row" onclick="toggleLogDetail(' + l.id + ')">' +
+          '<td class="muted mono" title="' + esc(l.timestamp) + '">' + fmtTime(l.timestamp) + '</td>' +
+          '<td>' + toolBadge(l.tool_name, l.method) + '</td>' +
+          '<td class="query-cell" title="' + esc(l.query_preview || '') + '">' + esc(l.query_preview || '-') + '</td>' +
+          '<td class="mono">' + (l.key_label ? (esc(l.key_label) + ' <span class="muted">(' + esc(l.masked_key) + ')</span>') : '-') + '</td>' +
+          '<td>' + logStatusBadge(l.status) + '</td>' +
+          '<td class="mono">' + (c > 0 ? ('$' + c.toFixed(3)) : '-') + '</td>' +
+          '<td class="mono">' + (l.latency_ms != null ? (l.latency_ms + ' ms') : '-') + '</td>' +
+          '<td class="err-text" title="' + esc(l.error_message || '') + '">' + esc(l.error_message || '-') + '</td>' +
+        '</tr>' +
+        '<tr class="log-detail-row" id="log-detail-' + l.id + '" style="display:' + (isOpen ? 'table-row' : 'none') + '">' +
+          '<td colspan="8"><div class="log-detail-box">' +
+            '<div><strong>Log #' + l.id + '</strong> · ' + esc(l.timestamp) + ' · HTTP ' + esc(l.http_status) + ' · Key: ' + esc(l.key_label || '-') + ' (' + esc(l.masked_key || '-') + ')</div>' +
+            '<div><strong>Query / Payload:</strong> ' + esc(l.query_preview || '-') + '</div>' +
+            (l.error_message ? ('<div style="color:var(--accent-maroon-dark)"><strong>Note / Error:</strong> ' + esc(l.error_message) + '</div>') : '') +
+          '</div></td>' +
+        '</tr>';
+      }).join('');
     }
 
     async function apiFetch(path, options = {}) {
@@ -951,7 +1148,7 @@ export function renderDashboardHtml() {
       try {
         const data = await apiFetch('/api/overview');
         badge.className = 'badge badge-active';
-        badge.textContent = 'ONLINE v' + (data.version || '1.2');
+        badge.textContent = 'ONLINE v' + (data.version || '1.5.0');
 
         const cost = Number(data.stats.totalCostUsd || 0);
         const quota = Number(data.stats.totalQuotaUsd || 0);
@@ -1000,32 +1197,8 @@ export function renderDashboardHtml() {
           }).join('');
         }
 
-        const lb = document.getElementById('logsTableBody');
-        if (!data.logs.length) {
-          lb.innerHTML = '<tr><td colspan="8" class="muted" style="text-align:center;padding:28px">No tool calls recorded yet.</td></tr>';
-        } else {
-          lb.innerHTML = data.logs.map(l => {
-            const c = Number(l.cost_usd || 0);
-            const isOpen = expandedLogIds.has(l.id);
-            return '<tr class="log-row" onclick="toggleLogDetail(' + l.id + ')">' +
-              '<td class="muted mono" title="' + esc(l.timestamp) + '">' + fmtTime(l.timestamp) + '</td>' +
-              '<td><span class="badge badge-tool">' + esc(l.tool_name || l.method) + '</span></td>' +
-              '<td class="query-cell" title="' + esc(l.query_preview || '') + '">' + esc(l.query_preview || '-') + '</td>' +
-              '<td class="mono">' + (l.key_label ? (esc(l.key_label) + ' <span class="muted">(' + esc(l.masked_key) + ')</span>') : '-') + '</td>' +
-              '<td>' + logStatusBadge(l.status) + '</td>' +
-              '<td class="mono">' + (c > 0 ? ('$' + c.toFixed(3)) : '-') + '</td>' +
-              '<td class="mono">' + (l.latency_ms != null ? (l.latency_ms + ' ms') : '-') + '</td>' +
-              '<td class="err-text" title="' + esc(l.error_message || '') + '">' + esc(l.error_message || '-') + '</td>' +
-            '</tr>' +
-            '<tr class="log-detail-row" id="log-detail-' + l.id + '" style="display:' + (isOpen ? 'table-row' : 'none') + '">' +
-              '<td colspan="8"><div class="log-detail-box">' +
-                '<div><strong>Log #' + l.id + '</strong> · ' + esc(l.timestamp) + ' · HTTP ' + esc(l.http_status) + ' · Key: ' + esc(l.key_label || '-') + ' (' + esc(l.masked_key || '-') + ')</div>' +
-                '<div><strong>Query / Payload:</strong> ' + esc(l.query_preview || '-') + '</div>' +
-                (l.error_message ? ('<div style="color:var(--accent-maroon-dark)"><strong>Note / Error:</strong> ' + esc(l.error_message) + '</div>') : '') +
-              '</div></td>' +
-            '</tr>';
-          }).join('');
-        }
+        currentRawLogs = data.logs || [];
+        renderLogs();
       } catch (err) {
         badge.className = 'badge badge-invalid';
         badge.textContent = err.message;
