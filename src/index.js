@@ -1084,9 +1084,9 @@ export default {
 
     const url = new URL(request.url);
 
-    // Serve WebUI Dashboard on GET / or GET /ui
-    if ((url.pathname === "/" || url.pathname === "/ui") && request.method === "GET") {
-      return new Response(renderDashboardHtml(), {
+    // Serve WebUI Dashboard on GET/HEAD / or /ui
+    if ((url.pathname === "/" || url.pathname === "/ui") && (request.method === "GET" || request.method === "HEAD")) {
+      return new Response(request.method === "HEAD" ? null : renderDashboardHtml(), {
         status: 200,
         headers: { "Content-Type": "text/html; charset=utf-8" },
       });
