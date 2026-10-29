@@ -978,7 +978,7 @@ export function renderDashboardHtml() {
 
     function renderMcpSnippet() {
       const origin = window.location.origin;
-      const proxyKey = getProxyKey() || "${EXA_PROXY_API_KEY}";
+      const proxyKey = getProxyKey() || "\${EXA_PROXY_API_KEY}";
       const mcpUrl = origin + "/mcp?tools=web_search_exa,web_fetch_exa,web_search_advanced_exa,agent_run";
 
       let snippet;

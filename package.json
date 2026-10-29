@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "node --check src/index.js && node --check src/ui.js",
+    "build": "node --check src/index.js && node --check src/ui.js && node -e \"import('./src/ui.js').then(m => m.renderDashboardHtml());\"",
     "dev": "node -e \"if (process.env.CI || process.env.CF_PAGES) { console.log('CI build verified'); process.exit(0); } import('node:child_process').then(({ spawnSync }) => process.exit(spawnSync('npx', ['wrangler', 'dev'], { stdio: 'inherit' }).status || 0));\"",
     "deploy": "wrangler deploy"
   },
