@@ -4,7 +4,7 @@ import { renderDashboardHtml } from "./ui.js";
 const DEFAULT_UPSTREAM = "https://mcp.exa.ai/mcp";
 const COOLDOWN_MS = 60_000;
 const MAX_LOGS = 200;
-const APP_VERSION = "1.3.0";
+const APP_VERSION = "1.4.0";
 
 function maskKey(key) {
   const clean = String(key || "").trim();
@@ -17,9 +17,9 @@ function corsHeaders() {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
     "Access-Control-Allow-Headers":
-      "Accept, Content-Type, Authorization, x-api-key, x-exa-source, Mcp-Session-Id, MCP-Protocol-Version, Last-Event-ID",
+      "Accept, Content-Type, Authorization, x-api-key, x-exa-source, Mcp-Session-Id, MCP-Protocol-Version, Last-Event-ID, X-Request-ID",
     "Access-Control-Expose-Headers":
-      "Mcp-Session-Id, MCP-Protocol-Version, X-Exa-Proxy-Key-Id, X-Exa-Proxy-Key-Label, X-Exa-Proxy-Cost-Usd",
+      "Mcp-Session-Id, MCP-Protocol-Version, X-Request-ID, X-Exa-Proxy-Key-Id, X-Exa-Proxy-Key-Label, X-Exa-Proxy-Cost-Usd",
   };
 }
 
@@ -64,7 +64,11 @@ function extractClientProxyKey(request, url) {
     return auth.slice(7).trim();
   }
 
-  const queryKey = url.searchParams.get("api_key") || url.searchParams.get("key");
+  const queryKey =
+    url.searchParams.get("api_key") ||
+    url.searchParams.get("key") ||
+    url.searchParams.get("exaApiKey") ||
+    url.searchParams.get("exa_api_key");
   if (queryKey) return queryKey.trim();
 
   return "";
@@ -104,7 +108,7 @@ async function checkAuth(request, url, env) {
 }
 
 function parseRpcPayload(bodyText) {
-  if (!bodyText) return { method: "unknown", toolName: null, queryPreview: null, isToolCall: false };
+  if (!bodyText) return { method: "unknown", toolName: null, args: {}, queryPreview: null, isToolCall: false };
   try {
     const parsed = JSON.parse(bodyText);
     const items = Array.isArray(parsed) ? parsed : [parsed];
@@ -115,7 +119,32 @@ function parseRpcPayload(bodyText) {
       const toolName = primary.params?.name || "tools/call";
       const args = primary.params?.arguments || {};
       let queryPreview = "";
-      if (typeof args.query === "string") {
+
+      if (toolName === "agent_run") {
+        const effortTag = args.effort ? `[effort:${args.effort}] ` : "";
+        if (typeof args.query === "string" && args.query) {
+          queryPreview = `${effortTag}${args.query}`;
+        } else if (typeof args.runId === "string" && args.runId) {
+          queryPreview = `[resume] ${args.runId}`;
+        } else if (typeof args.systemPrompt === "string" && args.systemPrompt) {
+          queryPreview = `${effortTag}System: ${args.systemPrompt}`;
+        } else {
+          queryPreview = `${effortTag}${JSON.stringify(args)}`;
+        }
+      } else if (toolName === "web_search_advanced_exa") {
+        const typeTag = args.type ? `[${args.type}] ` : "";
+        queryPreview = `${typeTag}${args.query || JSON.stringify(args)}`;
+      } else if (toolName === "web_search_exa") {
+        queryPreview = typeof args.query === "string" ? args.query : JSON.stringify(args);
+      } else if (toolName === "web_fetch_exa" || toolName === "crawling_exa") {
+        if (Array.isArray(args.urls)) {
+          queryPreview = args.urls.join(", ");
+        } else if (typeof args.url === "string") {
+          queryPreview = args.url;
+        } else {
+          queryPreview = JSON.stringify(args);
+        }
+      } else if (typeof args.query === "string") {
         queryPreview = args.query;
       } else if (typeof args.objective === "string") {
         queryPreview = args.type ? `[${args.type}] ${args.objective}` : args.objective;
@@ -124,9 +153,11 @@ function parseRpcPayload(bodyText) {
       } else {
         queryPreview = JSON.stringify(args);
       }
+
       return {
         method,
         toolName,
+        args,
         queryPreview: queryPreview.slice(0, 1000),
         isToolCall: true,
       };
@@ -134,25 +165,85 @@ function parseRpcPayload(bodyText) {
     return {
       method,
       toolName: null,
+      args: primary.params || {},
       queryPreview: primary.params ? JSON.stringify(primary.params).slice(0, 300) : null,
       isToolCall: false,
     };
   } catch {
-    return { method: "raw", toolName: null, queryPreview: null, isToolCall: false };
+    return { method: "raw", toolName: null, args: {}, queryPreview: null, isToolCall: false };
   }
+}
+
+function estimateToolCostUsd(rpcInfo) {
+  const name = rpcInfo?.toolName || "";
+  const args = rpcInfo?.args || {};
+
+  if (name === "web_search_exa") {
+    const num = Number(args.numResults) || 10;
+    return num > 10 ? Math.round((0.007 + (num - 10) * 0.001) * 10000) / 10000 : 0.007;
+  }
+  if (name === "web_fetch_exa" || name === "crawling_exa") {
+    const count = Array.isArray(args.urls) ? args.urls.length : (args.url ? 1 : 1);
+    return Math.max(1, count) * 0.001;
+  }
+  if (name === "web_search_advanced_exa") {
+    const t = String(args.type || "auto").toLowerCase();
+    if (t === "deep-reasoning") return 0.015;
+    if (t === "deep" || t === "deep-lite") return 0.012;
+    if (t === "lite" || t === "instant") return 0.004;
+    const num = Number(args.numResults) || 10;
+    return num > 10 ? Math.round((0.007 + (num - 10) * 0.001) * 10000) / 10000 : 0.007;
+  }
+  if (name === "agent_run") {
+    const effort = String(args.effort || "low").toLowerCase();
+    if (effort === "minimal") return 0.012;
+    if (effort === "medium") return 0.05;
+    if (effort === "high" || effort === "xhigh") return 0.10;
+    return 0.02;
+  }
+  if (name === "deep_search_exa") {
+    return 0.012;
+  }
+  return 0.007;
 }
 
 function extractExaCostUsd(bodyText) {
   if (!bodyText) return 0;
   const text = String(bodyText);
+
+  // 1. Check _meta["ai.exa/usage"].costDollars
   const metaMatch = text.match(/"ai\.exa\/usage"\s*:\s*\{\s*"costDollars"\s*:\s*([0-9]+(?:\.[0-9]+)?)/);
   if (metaMatch) return Number(metaMatch[1]) || 0;
 
-  const totalMatch = text.match(/\\?"costDollars\\?"\s*:\s*\{\s*\\?"total\\?"\s*:\s*([0-9]+(?:\.[0-9]+)?)/);
+  // 2. Check costDollars: { total: 0.007 } (including escaped JSON in SSE)
+  const totalMatch = text.match(/\\?"costDollars\\?"\s*:\s*\{[^}]*\\?"total\\?"\s*:\s*([0-9]+(?:\.[0-9]+)?)/);
   if (totalMatch) return Number(totalMatch[1]) || 0;
 
-  const numMatch = text.match(/\\?"costDollars\\?"\s*:\s*([0-9]+(?:\.[0-9]+)?)/);
-  if (numMatch) return Number(numMatch[1]) || 0;
+  // 3. Check costDollars: 0.007 (number or numeric string)
+  const directNumMatch = text.match(/\\?"costDollars\\?"\s*:\s*\\?"?([0-9]+(?:\.[0-9]+)?)\\?"?/);
+  if (directNumMatch) return Number(directNumMatch[1]) || 0;
+
+  // 4. Try parsing JSON if valid
+  try {
+    const parsed = JSON.parse(text);
+    const target = parsed.result?.output || parsed.result || parsed;
+    if (target && target.costDollars) {
+      if (typeof target.costDollars === "number") return target.costDollars;
+      if (typeof target.costDollars.total === "number") return target.costDollars.total;
+      if (typeof target.costDollars === "object") {
+        let sum = 0;
+        for (const val of Object.values(target.costDollars)) {
+          if (typeof val === "number") sum += val;
+          else if (typeof val === "object" && val !== null) {
+            for (const sub of Object.values(val)) {
+              if (typeof sub === "number") sum += sub;
+            }
+          }
+        }
+        if (sum > 0) return Math.round(sum * 10000) / 10000;
+      }
+    }
+  } catch {}
 
   return 0;
 }
@@ -170,19 +261,24 @@ function inspectExaResponse(httpStatus, bodyText) {
     return { keyFailure: "cooldown", reason: `HTTP 429: Exa API key rate limited` };
   }
 
-  const hasIsError = text.includes('"isError":true') || text.includes('"isError": true');
-  if (hasIsError) {
-    if (/error \((401|403)\)|invalid api key|unauthorized api key/i.test(text)) {
-      const m = text.match(/([^\n"\\]*error \((?:401|403)\)[^\n"\\]*)/i);
-      return { keyFailure: "invalid", reason: m ? m[1] : "Exa error (401): Invalid API key" };
+  const isErrorPayload =
+    text.includes('"isError":true') ||
+    text.includes('"isError": true') ||
+    text.includes('"error":{') ||
+    text.includes('"error": {');
+
+  if (isErrorPayload) {
+    if (/error \((401|403)\)|invalid (?:api )?key|unauthorized|authenticate with an exa api key|api key is not valid/i.test(text)) {
+      const m = text.match(/([^\n"\\]*(?:error \((?:401|403)\)|invalid (?:api )?key|unauthorized|authenticate)[^\n"\\]*)/i);
+      return { keyFailure: "invalid", reason: m ? m[1].trim() : "Exa error (401): Invalid API key" };
     }
-    if (/error \(402\)|payment required|insufficient credits|out of credits|quota exceeded|exceeded your .* limit/i.test(text)) {
-      const m = text.match(/([^\n"\\]*(?:error \(402\)|quota|credits|limit)[^\n"\\]*)/i);
-      return { keyFailure: "exhausted", reason: m ? m[1] : "Exa error (402): Quota or credits exhausted" };
+    if (/error \(402\)|payment required|insufficient credits|out of credits|quota exceeded|exceeded your .* limit|credits depleted|daily request quota/i.test(text)) {
+      const m = text.match(/([^\n"\\]*(?:error \(402\)|quota|credits|limit|payment required)[^\n"\\]*)/i);
+      return { keyFailure: "exhausted", reason: m ? m[1].trim() : "Exa error (402): Quota or credits exhausted" };
     }
-    if (/error \(429\)|rate limit|too many requests/i.test(text)) {
-      const m = text.match(/([^\n"\\]*(?:error \(429\)|rate limit|too many requests)[^\n"\\]*)/i);
-      return { keyFailure: "cooldown", reason: m ? m[1] : "Exa error (429): Rate limit reached" };
+    if (/error \(429\)|rate limit|too many requests|rate or concurrency limit reached|concurrency limit|free tier rate limit/i.test(text)) {
+      const m = text.match(/([^\n"\\]*(?:error \(429\)|rate limit|too many requests|concurrency limit)[^\n"\\]*)/i);
+      return { keyFailure: "cooldown", reason: m ? m[1].trim() : "Exa error (429): Rate limit reached" };
     }
   }
 
@@ -197,7 +293,7 @@ async function proxyMcpRequest(request, url, env, stub) {
   const upstreamBase = env.UPSTREAM_MCP_URL || DEFAULT_UPSTREAM;
   const upstreamUrl = new URL(upstreamBase);
   for (const [k, v] of url.searchParams.entries()) {
-    if (k === "api_key" || k === "key") continue;
+    if (k === "api_key" || k === "key" || k === "exaApiKey" || k === "exa_api_key") continue;
     upstreamUrl.searchParams.set(k, v);
   }
 
@@ -212,6 +308,8 @@ async function proxyMcpRequest(request, url, env, stub) {
     "mcp-session-id",
     "mcp-protocol-version",
     "last-event-id",
+    "x-exa-source",
+    "x-request-id",
   ];
   for (const h of copyHeaderNames) {
     const val = request.headers.get(h);
@@ -220,19 +318,32 @@ async function proxyMcpRequest(request, url, env, stub) {
   if (!baseHeaders.has("accept")) {
     baseHeaders.set("Accept", "application/json, text/event-stream");
   }
+  if (!baseHeaders.has("x-exa-source")) {
+    baseHeaders.set("x-exa-source", "exa-mcp-proxy/1.4.0");
+  }
   baseHeaders.set("User-Agent", "exa-mcp-client/1.0");
 
-  // Non-tool-call MCP requests (initialize, notifications/initialized, tools/list, resources/list, resources/read, prompts/list)
+  // Non-tool-call MCP requests (initialize, notifications/initialized, tools/list, resources/list, resources/read, prompts/list, GET /mcp SSE)
   if (!rpcInfo.isToolCall) {
     const peeked = await stub.rpcPeekKey();
     if (peeked?.api_key) {
       baseHeaders.set("x-api-key", peeked.api_key);
+      upstreamUrl.searchParams.set("exaApiKey", peeked.api_key);
     }
     const resp = await fetch(upstreamUrl.toString(), {
       method,
       headers: baseHeaders,
       body: method === "POST" || method === "PUT" ? bodyText : undefined,
     });
+
+    const isSse = resp.headers.get("content-type")?.includes("text/event-stream") || method === "GET";
+    if (isSse) {
+      return new Response(resp.body, {
+        status: resp.status,
+        headers: buildMcpResponseHeaders(resp.headers),
+      });
+    }
+
     const respText = await resp.text();
     return new Response(respText, {
       status: resp.status,
@@ -267,6 +378,9 @@ async function proxyMcpRequest(request, url, env, stub) {
       break;
     }
 
+    const attemptUrl = new URL(upstreamUrl.toString());
+    attemptUrl.searchParams.set("exaApiKey", selectedKey.api_key);
+
     const attemptHeaders = new Headers(baseHeaders);
     attemptHeaders.set("x-api-key", selectedKey.api_key);
     if (attempt > 1) {
@@ -275,7 +389,7 @@ async function proxyMcpRequest(request, url, env, stub) {
 
     const startMs = Date.now();
     try {
-      const upstreamResp = await fetch(upstreamUrl.toString(), {
+      const upstreamResp = await fetch(attemptUrl.toString(), {
         method,
         headers: attemptHeaders,
         body: bodyText,
@@ -306,7 +420,7 @@ async function proxyMcpRequest(request, url, env, stub) {
         continue;
       }
 
-      const costUsd = extractExaCostUsd(respText);
+      const costUsd = extractExaCostUsd(respText) || estimateToolCostUsd(rpcInfo);
       await stub.rpcRecordOutcome({
         ok: true,
         keyId: selectedKey.id,
@@ -751,7 +865,7 @@ export class ExaProxyCoordinator extends DurableObject {
     const upstreamUrl = this.env.UPSTREAM_MCP_URL || DEFAULT_UPSTREAM;
     const start = Date.now();
     try {
-      const resp = await fetch(`${upstreamUrl}?tools=web_search_exa`, {
+      const resp = await fetch(`${upstreamUrl}?tools=web_search_exa&exaApiKey=${encodeURIComponent(keyRow.api_key)}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -767,7 +881,6 @@ export class ExaProxyCoordinator extends DurableObject {
             name: "web_search_exa",
             arguments: {
               query: "Exa AI search",
-              objective: "Verify API key health",
               numResults: 1,
             },
           },

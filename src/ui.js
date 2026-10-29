@@ -722,7 +722,7 @@ export function renderDashboardHtml() {
           <span class="index-tag index-tag--muted">PROVISION</span>
           <h2 class="section-title">Add Exa API Keys</h2>
         </div>
-        <span class="mono muted" style="font-size:11.5px">~$0.007 / auto search · ~$0.012–$0.015 / deep search</span>
+        <span class="mono muted" style="font-size:11.5px">~$0.007 / auto search · ~$0.001 / fetched URL · ~$0.012–$0.02+ / agent run</span>
       </div>
       <div class="section-body">
         <div class="add-grid">
@@ -883,15 +883,16 @@ export function renderDashboardHtml() {
       const snippet = {
         mcpServers: {
           exa: {
-            url: origin + "/mcp?tools=web_search_exa,web_fetch_exa,web_search_advanced_exa,deep_search_exa",
+            url: origin + "/mcp?tools=web_search_exa,web_fetch_exa,web_search_advanced_exa,agent_run",
             headers: {
               "x-api-key": getProxyKey() || "\${EXA_PROXY_API_KEY}"
             },
             exposure: "codemode",
             toolExposure: {
-              web_search_exa: "direct"
+              web_search_exa: "direct",
+              web_fetch_exa: "direct"
             },
-            description: "Real-time web search, advanced search, deep research, and content extraction via Exa LB Proxy"
+            description: "Real-time web search, content extraction, advanced search, and autonomous multi-step research via Exa LB Proxy"
           }
         }
       };

@@ -6,17 +6,21 @@ description: Default web search for all queries — real-time web research, curr
 # Exa Neural Search & Research Skill
 
 - **Direct tools (also callable in `codemode`)**:
-  - `mcp__exa__web_search_exa({ query, objective, numResults })` — default `auto` neural search
+  - `mcp__exa__web_search_exa({ query, numResults })` — default `auto` neural search
   - `mcp__exa__web_fetch_exa({ urls, maxCharacters })` — primary web-to-Markdown fetcher (batch multiple URLs in `urls`)
 - **Codemode tools**:
-  - `tools.mcp__exa__deep_search_exa({ objective, type: "deep" | "deep-reasoning", systemPrompt, outputSchema, numResults })`
-  - `tools.mcp__exa__web_search_advanced_exa({ query, type: "auto" | "fast" | "instant", category, startPublishedDate, ... })`
+  - `tools.mcp__exa__agent_run({ query, effort: "minimal" | "low" | "medium" | "high" | "auto", outputSchema, systemPrompt, dataSources, runId, previousRunId })` — autonomous multi-step research, list building, enrichment, and structured output
+  - `tools.mcp__exa__web_search_advanced_exa({ query, type: "auto" | "lite" | "deep" | "deep-reasoning", category, includeDomains, excludeDomains, startPublishedDate, endPublishedDate, ... })` — full Exa Search API control
+  - `tools.mcp__exa__deep_search_exa(...)` — backwards-compatible alias (prefer `agent_run` or `web_search_advanced_exa`)
 
-## 1. Search Mode Selection (`auto` vs. `deep` / `deep-reasoning`)
+## 1. Tool Selection (`auto` vs. `agent_run` vs. `deep`)
 
-- **General & routine searches (`auto`, ~$0.007, 1–2s)**: Use `web_search_exa` (or `web_search_advanced_exa` with `type: "auto"`) for everyday lookups, fact-checking, news, and fast single-angle paper discovery.
-- **Academic & complex synthesis (`deep` 4–12s / `deep-reasoning` 12–50s, ~$0.012–$0.015)**: Use `deep_search_exa` for literature reviews, multi-angle evidence synthesis, or conflicting findings.
-  - **CRITICAL to unlock Deep Search**: Always pass `outputSchema` (e.g. `{ type: "object", properties: { theoreticalSynthesis: { type: "string" }, keyEmpiricalFindings: { type: "array", items: { type: "string" } } }, required: [...] }`) and `systemPrompt`, and **omit `search_queries`** (or keep ≤5 words each) so Exa's research agent autonomously expands sub-queries and returns grounded synthesis (`output.content`), field-level citations (`output.grounding`), and raw `results`. Without `outputSchema`, the MCP server strips the synthesis and returns only raw snippets.
+- **Routine lookups & fast discovery (`auto`, ~$0.007, 1–2s)**: Use `web_search_exa` (or `web_search_advanced_exa`) for everyday lookups, breaking news, fact verification, and targeted single-angle research.
+- **Autonomous multi-step research & lists (`agent_run`, ~$0.012–$0.05+, 10–50s)**: Use `agent_run` for multi-step investigations, competitive analysis, entity lists, or grounded synthesis.
+  - Omit `effort` to use default `low` ($0.02). Use `minimal` ($0.012) for quick checks, `medium` ($0.05) or `high` ($0.10) for exhaustive sweeps.
+  - Pass `outputSchema` (top-level object with bounded arrays and evidence fields) and `systemPrompt` for structured findings.
+  - If returned status is `"running"`, resume by calling `agent_run` again with `runId` until `outputReady` is true.
+- **Academic & deep synthesis (`web_search_advanced_exa` with `type: "deep"`, ~$0.012–$0.015)**: Use when domain filters (`includeDomains`) or date bounds are needed with query expansion and structured answers.
 
 ## 2. Neural Search Principles (for `web_search_exa` / `web_search_advanced_exa`)
 
@@ -26,6 +30,6 @@ description: Default web search for all queries — real-time web research, curr
 
 ## 3. Two-Stage Workflow & Output Standards
 
-1. **Discovery**: Run `web_search_exa` (`auto`) for targeted queries, or `deep_search_exa` (`deep` / `deep-reasoning` + `outputSchema`) for multi-hop academic synthesis.
+1. **Discovery**: Run `web_search_exa` (`auto`) for targeted queries, or `agent_run` for autonomous multi-step investigations.
 2. **Extraction (`web_fetch_exa`)**: Batch the top 2–4 authoritative URLs in a single `web_fetch_exa({ urls: [...] })` call to retrieve full Markdown text, statistics, and exact quotes.
 3. **Synthesis**: Separate empirical findings (sample size $N$, design, effect sizes) from commentary; cite every claim with `[Title / Source](URL)`.
