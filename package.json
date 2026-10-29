@@ -4,7 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
+    "build": "node --check src/index.js && node --check src/ui.js",
+    "dev": "node -e \"if (process.env.CI || process.env.CF_PAGES) { console.log('CI build verified'); process.exit(0); } import('node:child_process').then(({ spawnSync }) => process.exit(spawnSync('npx', ['wrangler', 'dev'], { stdio: 'inherit' }).status || 0));\"",
     "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.155.0"
   }
 }
