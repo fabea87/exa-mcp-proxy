@@ -4,7 +4,29 @@ import { renderDashboardHtml } from "./ui.js";
 const DEFAULT_UPSTREAM = "https://mcp.exa.ai/mcp";
 const COOLDOWN_MS = 60_000;
 const MAX_LOGS = 200;
-const APP_VERSION = "1.5.0";
+const APP_VERSION = "1.6.0";
+
+// Module-level worker edge cache for fast read-only MCP handshakes (tools/list, initialize, GET /mcp SSE)
+let cachedPeekKey = null;
+let cachedPeekKeyExpiresAt = 0;
+const PEEK_CACHE_TTL_MS = 60_000;
+
+function getCachedPeekKey() {
+  if (cachedPeekKey && Date.now() < cachedPeekKeyExpiresAt) {
+    return cachedPeekKey;
+  }
+  return null;
+}
+
+function setCachedPeekKey(key) {
+  cachedPeekKey = key;
+  cachedPeekKeyExpiresAt = Date.now() + PEEK_CACHE_TTL_MS;
+}
+
+function clearCachedPeekKey() {
+  cachedPeekKey = null;
+  cachedPeekKeyExpiresAt = 0;
+}
 
 function maskKey(key) {
   const clean = String(key || "").trim();
@@ -289,7 +311,7 @@ function inspectExaResponse(httpStatus, bodyText) {
  * Stateless Worker MCP handler: performs all network I/O outside the Durable Object
  * while calling <1ms synchronous SQLite RPC methods on ExaProxyCoordinator.
  */
-async function proxyMcpRequest(request, url, env, stub) {
+async function proxyMcpRequest(request, url, env, stub, ctx) {
   const upstreamBase = env.UPSTREAM_MCP_URL || DEFAULT_UPSTREAM;
   const upstreamUrl = new URL(upstreamBase);
   for (const [k, v] of url.searchParams.entries()) {
@@ -319,13 +341,19 @@ async function proxyMcpRequest(request, url, env, stub) {
     baseHeaders.set("Accept", "application/json, text/event-stream");
   }
   if (!baseHeaders.has("x-exa-source")) {
-    baseHeaders.set("x-exa-source", "exa-mcp-proxy/1.5.0");
+    baseHeaders.set("x-exa-source", `exa-mcp-proxy/${APP_VERSION}`);
   }
   baseHeaders.set("User-Agent", "exa-mcp-client/1.0");
 
   // Non-tool-call MCP requests (initialize, notifications/initialized, tools/list, resources/list, resources/read, prompts/list, GET /mcp SSE)
   if (!rpcInfo.isToolCall) {
-    const peeked = await stub.rpcPeekKey();
+    let peeked = getCachedPeekKey();
+    if (!peeked) {
+      peeked = await stub.rpcPeekKey();
+      if (peeked?.api_key) {
+        setCachedPeekKey(peeked);
+      }
+    }
     if (peeked?.api_key) {
       baseHeaders.set("x-api-key", peeked.api_key);
       upstreamUrl.searchParams.set("exaApiKey", peeked.api_key);
@@ -335,6 +363,10 @@ async function proxyMcpRequest(request, url, env, stub) {
       headers: baseHeaders,
       body: method === "POST" || method === "PUT" ? bodyText : undefined,
     });
+
+    if (resp.status === 401 || resp.status === 403) {
+      clearCachedPeekKey();
+    }
 
     const isSse = resp.headers.get("content-type")?.includes("text/event-stream") || method === "GET";
     if (isSse) {
@@ -421,7 +453,7 @@ async function proxyMcpRequest(request, url, env, stub) {
       }
 
       const costUsd = extractExaCostUsd(respText) || estimateToolCostUsd(rpcInfo);
-      await stub.rpcRecordOutcome({
+      const outcomePromise = stub.rpcRecordOutcome({
         ok: true,
         keyId: selectedKey.id,
         keyLabel: selectedKey.label,
@@ -434,6 +466,13 @@ async function proxyMcpRequest(request, url, env, stub) {
         latencyMs,
         attempt,
       });
+
+      // Decouple background analytics logging from client latency
+      if (ctx && typeof ctx.waitUntil === "function") {
+        ctx.waitUntil(outcomePromise);
+      } else {
+        await outcomePromise;
+      }
 
       return new Response(respText, {
         status: upstreamResp.status,
@@ -483,6 +522,12 @@ export class ExaProxyCoordinator extends DurableObject {
     this.ctx = ctx;
     this.env = env;
     this.sql = ctx.storage.sql;
+    this.inFlight = new Map();
+    this.statsCache = null;
+    this.statsDirty = false;
+    this.statFlushCounter = 0;
+    this.lastRefresh = 0;
+    this.logsSincePrune = 0;
     this.initDb();
   }
 
@@ -551,20 +596,58 @@ export class ExaProxyCoordinator extends DurableObject {
     this.sql.exec("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", key, String(defaultValue));
   }
 
-  getSetting(key, fallback = "") {
+  initStatsCache() {
+    this.statsCache = {
+      total_requests: Number(this.getSettingFromDb("total_requests", "0")) || 0,
+      total_tool_calls: Number(this.getSettingFromDb("total_tool_calls", "0")) || 0,
+      total_failovers: Number(this.getSettingFromDb("total_failovers", "0")) || 0,
+    };
+    this.statsDirty = false;
+  }
+
+  getSettingFromDb(key, fallback = "") {
     const rows = this.sql.exec("SELECT value FROM settings WHERE key = ?", key).toArray();
     return rows.length ? rows[0].value : fallback;
   }
 
+  getSetting(key, fallback = "") {
+    if (this.statsCache && key in this.statsCache) {
+      return String(this.statsCache[key]);
+    }
+    return this.getSettingFromDb(key, fallback);
+  }
+
   setSetting(key, value) {
+    if (!this.statsCache) {
+      this.initStatsCache();
+    }
+    if (key in this.statsCache) {
+      this.statsCache[key] = Number(value) || 0;
+      this.statsDirty = true;
+    }
     this.sql.exec("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", key, String(value));
   }
 
   incrementCounter(key, delta = 1) {
-    const cur = Number(this.getSetting(key, "0")) || 0;
-    const next = cur + delta;
-    this.setSetting(key, String(next));
-    return next;
+    if (!this.statsCache) {
+      this.initStatsCache();
+    }
+    this.statsCache[key] = (this.statsCache[key] || 0) + delta;
+    this.statsDirty = true;
+    this.flushStatsIfNeeded(false);
+    return this.statsCache[key];
+  }
+
+  flushStatsIfNeeded(force = false) {
+    if (!this.statsDirty || !this.statsCache) return;
+    this.statFlushCounter = (this.statFlushCounter || 0) + 1;
+    if (force || this.statFlushCounter >= 25) {
+      this.statFlushCounter = 0;
+      for (const [k, v] of Object.entries(this.statsCache)) {
+        this.sql.exec("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", k, String(v));
+      }
+      this.statsDirty = false;
+    }
   }
 
   /**
@@ -603,6 +686,16 @@ export class ExaProxyCoordinator extends DurableObject {
    * Synchronous RPC: Record outcome of a tool call (<1ms SQLite).
    */
   rpcRecordOutcome(outcome) {
+    if (outcome.keyId != null) {
+      const keyId = Number(outcome.keyId);
+      const cur = this.inFlight.get(keyId) || 0;
+      if (cur > 1) {
+        this.inFlight.set(keyId, cur - 1);
+      } else {
+        this.inFlight.delete(keyId);
+      }
+    }
+
     if (outcome.ok) {
       this.recordKeySuccess(outcome.keyId, outcome.costUsd);
       this.appendCallLog({
@@ -698,8 +791,12 @@ export class ExaProxyCoordinator extends DurableObject {
     return added;
   }
 
-  refreshKeyStates() {
+  refreshKeyStates(force = false) {
     const now = Date.now();
+    if (!force && this.lastRefresh && now - this.lastRefresh < 3000) {
+      return;
+    }
+    this.lastRefresh = now;
     // 1. Recover expired cooldowns
     this.sql.exec(
       "UPDATE api_keys SET status = 'active', cooldown_until = 0 WHERE status = 'cooldown' AND cooldown_until <= ?",
@@ -716,7 +813,7 @@ export class ExaProxyCoordinator extends DurableObject {
   }
 
   peekHealthyKey() {
-    this.refreshKeyStates();
+    this.refreshKeyStates(false);
     const rows = this.sql
       .exec("SELECT * FROM api_keys WHERE enabled = 1 AND status = 'active' ORDER BY id ASC LIMIT 1")
       .toArray();
@@ -724,7 +821,7 @@ export class ExaProxyCoordinator extends DurableObject {
   }
 
   selectHealthyKey(excludeIds = []) {
-    this.refreshKeyStates();
+    this.refreshKeyStates(false);
 
     const strategy = this.getSetting("strategy", "least_used");
     const allEligible = this.sql
@@ -744,10 +841,16 @@ export class ExaProxyCoordinator extends DurableObject {
       chosen = allEligible[rrIndex % allEligible.length];
       this.setSetting("rr_index", String((rrIndex + 1) % Math.max(1, allEligible.length)));
     } else {
+      // Concurrency-aware least_used: prioritize idle keys (lowest in-flight) first, then cumulative usage
       allEligible.sort((a, b) => {
+        const infA = this.inFlight.get(Number(a.id)) || 0;
+        const infB = this.inFlight.get(Number(b.id)) || 0;
+        if (infA !== infB) return infA - infB;
+
         const ca = Number(a.total_calls) || 0;
         const cb = Number(b.total_calls) || 0;
         if (ca !== cb) return ca - cb;
+
         const ta = a.last_used_at || "";
         const tb = b.last_used_at || "";
         if (ta !== tb) return ta.localeCompare(tb);
@@ -755,6 +858,9 @@ export class ExaProxyCoordinator extends DurableObject {
       });
       chosen = allEligible[0];
     }
+
+    const keyId = Number(chosen.id);
+    this.inFlight.set(keyId, (this.inFlight.get(keyId) || 0) + 1);
 
     const nowIso = new Date().toISOString();
     this.sql.exec(
@@ -854,11 +960,16 @@ export class ExaProxyCoordinator extends DurableObject {
       entry.errorMessage ? String(entry.errorMessage).slice(0, 500) : null
     );
 
-    this.sql.exec(
-      `DELETE FROM call_logs
-       WHERE id NOT IN (SELECT id FROM call_logs ORDER BY id DESC LIMIT ?)`,
-      MAX_LOGS
-    );
+    // Amortize pruning: delete in batches of 50 using indexed range condition to avoid SQLite table locks
+    this.logsSincePrune = (this.logsSincePrune || 0) + 1;
+    if (this.logsSincePrune >= 50) {
+      this.logsSincePrune = 0;
+      this.sql.exec(
+        `DELETE FROM call_logs
+         WHERE id < (SELECT id FROM call_logs ORDER BY id DESC LIMIT 1 OFFSET ?)`,
+        MAX_LOGS
+      );
+    }
   }
 
   async verifySingleKey(keyRow) {
@@ -920,15 +1031,21 @@ export class ExaProxyCoordinator extends DurableObject {
     const method = request.method.toUpperCase();
 
     if (path === "/api/overview" && method === "GET") {
-      this.refreshKeyStates();
+      this.flushStatsIfNeeded(true);
+      this.refreshKeyStates(true);
 
-      const keys = this.sql
+      const rawKeys = this.sql
         .exec(
           `SELECT id, label, masked_key, enabled, status, total_calls, success_calls, error_calls,
                   total_cost_usd, quota_usd, last_used_at, last_error, cooldown_until, created_at
            FROM api_keys ORDER BY id ASC`
         )
         .toArray();
+
+      const keys = rawKeys.map((k) => ({
+        ...k,
+        in_flight: this.inFlight.get(Number(k.id)) || 0,
+      }));
 
       const logs = this.sql
         .exec("SELECT * FROM call_logs ORDER BY id DESC LIMIT 80")
@@ -939,6 +1056,7 @@ export class ExaProxyCoordinator extends DurableObject {
       const totalRequests = Number(this.getSetting("total_requests", "0")) || 0;
       const totalToolCalls = Number(this.getSetting("total_tool_calls", "0")) || 0;
       const totalFailovers = Number(this.getSetting("total_failovers", "0")) || 0;
+      const totalInFlight = Array.from(this.inFlight.values()).reduce((a, b) => a + b, 0);
       const strategy = this.getSetting("strategy", "least_used");
 
       const okLogs = logs.filter((l) => l.status === "ok");
@@ -964,6 +1082,7 @@ export class ExaProxyCoordinator extends DurableObject {
           totalRequests,
           totalToolCalls,
           totalFailovers,
+          totalInFlight,
           totalCostUsd,
           totalQuotaUsd,
           successRate,
@@ -995,9 +1114,14 @@ export class ExaProxyCoordinator extends DurableObject {
 
     if (path === "/api/keys/reset-stats" && method === "POST") {
       this.sql.exec("UPDATE api_keys SET total_calls = 0, success_calls = 0, error_calls = 0, total_cost_usd = 0");
+      this.inFlight.clear();
       this.setSetting("total_tool_calls", "0");
       this.setSetting("total_failovers", "0");
       this.setSetting("rr_index", "0");
+      if (this.statsCache) {
+        this.statsCache.total_tool_calls = 0;
+        this.statsCache.total_failovers = 0;
+      }
       return jsonResponse({ ok: true });
     }
 
@@ -1077,7 +1201,7 @@ export class ExaProxyCoordinator extends DurableObject {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders() });
     }
@@ -1108,7 +1232,7 @@ export default {
 
       // Perform network-bound MCP proxying in the stateless Worker using <1ms DO RPCs
       if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {
-        return proxyMcpRequest(request, url, env, stub);
+        return proxyMcpRequest(request, url, env, stub, ctx);
       }
       return stub.fetch(request);
     }

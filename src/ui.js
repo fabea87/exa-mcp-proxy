@@ -703,7 +703,7 @@ export function renderDashboardHtml() {
           <path d="M285.673 62.9573L325.127 112.948C325.726 113.707 325.183 114.82 324.213 114.82H305.929C305.572 114.82 305.235 114.657 305.015 114.378L275.053 76.414L245.093 114.378C244.872 114.657 244.536 114.82 244.179 114.82H225.893C224.924 114.82 224.381 113.707 224.98 112.948L264.433 62.9573L227.177 15.7512C226.578 14.9921 227.121 13.8793 228.091 13.8793H246.375C246.732 13.8793 247.068 14.0423 247.289 14.3214L275.053 49.5006L302.818 14.3214C303.038 14.0423 303.375 13.8793 303.731 13.8793H322.016C322.985 13.8793 323.528 14.9921 322.929 15.7512L285.673 62.9573Z" fill="#101321"/>
         </svg>
         <div class="brand-divider"></div>
-        <span class="index-tag">MCP PROXY // POOL v1.5.0</span>
+        <span class="index-tag">MCP PROXY // POOL v1.6.0</span>
         <span id="connBadge" class="badge badge-disabled">Connecting</span>
       </div>
       <div class="controls">
@@ -1148,7 +1148,7 @@ export function renderDashboardHtml() {
       try {
         const data = await apiFetch('/api/overview');
         badge.className = 'badge badge-active';
-        badge.textContent = 'ONLINE v' + (data.version || '1.5.0');
+        badge.textContent = 'ONLINE v' + (data.version || '1.6.0');
 
         const cost = Number(data.stats.totalCostUsd || 0);
         const quota = Number(data.stats.totalQuotaUsd || 0);
@@ -1182,7 +1182,7 @@ export function renderDashboardHtml() {
               '<td class="mono muted">' + esc(k.masked_key) + '</td>' +
               '<td>' + statusBadge(k) + '</td>' +
               '<td><div class="bar-wrap"><div class="bar-fill" style="width:' + pct + '%"></div></div><span class="mono">' + pct + '%</span></td>' +
-              '<td class="mono">' + k.total_calls + ' <span class="muted">(' + k.success_calls + ' / ' + k.error_calls + ')</span></td>' +
+              '<td class="mono">' + k.total_calls + (k.in_flight ? ' <span class="badge" style="background:#e0e7ff;color:#3730a3;font-size:10px;padding:2px 5px;margin-left:4px" title="Active in-flight requests">' + k.in_flight + ' live</span>' : '') + ' <span class="muted">(' + k.success_calls + ' / ' + k.error_calls + ')</span></td>' +
               '<td class="mono">$' + kCost.toFixed(3) + ' / $' + kQuota.toFixed(2) + ' <span class="muted">($' + kLeft.toFixed(2) + ')</span></td>' +
               '<td class="mono muted" title="' + esc(k.last_used_at || '') + '">' + fmtTime(k.last_used_at) + '</td>' +
               '<td class="err-text" title="' + esc(k.last_error || '') + '">' + esc(k.last_error || '-') + '</td>' +
