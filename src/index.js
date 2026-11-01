@@ -4,7 +4,7 @@ import { renderDashboardHtml } from "./ui.js";
 const DEFAULT_UPSTREAM = "https://mcp.exa.ai/mcp";
 const COOLDOWN_MS = 60_000;
 const MAX_LOGS = 200;
-const APP_VERSION = "1.6.0";
+const APP_VERSION = "1.6.1";
 
 // Module-level worker edge cache for fast read-only MCP handshakes (tools/list, initialize, GET /mcp SSE)
 let cachedPeekKey = null;
@@ -453,6 +453,15 @@ async function proxyMcpRequest(request, url, env, stub, ctx) {
       }
 
       const costUsd = extractExaCostUsd(respText) || estimateToolCostUsd(rpcInfo);
+
+      // Register sticky agent_run mapping for resume calls
+      if (rpcInfo.toolName === "agent_run") {
+        const runMatch = respText.match(/"id"\s*:\s*"(agent_run_[a-zA-Z0-9_-]+)"/);
+        if (runMatch) {
+          stub.rpcRegisterAgentRun(runMatch[1], selectedKey.id);
+        }
+      }
+
       const outcomePromise = stub.rpcRecordOutcome({
         ok: true,
         keyId: selectedKey.id,
@@ -569,6 +578,11 @@ export class ExaProxyCoordinator extends DurableObject {
         cost_usd REAL NOT NULL DEFAULT 0,
         error_message TEXT
       );
+      CREATE TABLE IF NOT EXISTS agent_runs (
+        run_id TEXT PRIMARY KEY,
+        key_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+      );
     `);
 
     try {
@@ -666,7 +680,7 @@ export class ExaProxyCoordinator extends DurableObject {
       this.incrementCounter("total_requests", 1);
       this.incrementCounter("total_tool_calls", 1);
     }
-    const chosen = this.selectHealthyKey(excludeIds);
+    const chosen = this.selectHealthyKey(excludeIds, rpcInfo);
     if (!chosen && isFirstAttempt) {
       this.appendCallLog({
         method: rpcInfo.method || "tools/call",
@@ -680,6 +694,20 @@ export class ExaProxyCoordinator extends DurableObject {
       });
     }
     return chosen;
+  }
+
+  /**
+   * Register sticky mapping between an agent_run ID and the Exa key that owns it.
+   */
+  rpcRegisterAgentRun(runId, keyId) {
+    if (!runId || !keyId) return;
+    const nowIso = new Date().toISOString();
+    this.sql.exec(
+      "INSERT OR REPLACE INTO agent_runs (run_id, key_id, created_at) VALUES (?, ?, ?)",
+      String(runId).trim(),
+      Number(keyId),
+      nowIso
+    );
   }
 
   /**
@@ -820,8 +848,33 @@ export class ExaProxyCoordinator extends DurableObject {
     return rows.length ? rows[0] : null;
   }
 
-  selectHealthyKey(excludeIds = []) {
+  selectHealthyKey(excludeIds = [], rpcInfo = {}) {
     this.refreshKeyStates(false);
+
+    // Sticky session routing: resume agent_run on the exact Exa key that owns the run
+    const targetRunId = rpcInfo?.args?.runId || rpcInfo?.args?.previousRunId;
+    if (targetRunId && typeof targetRunId === "string") {
+      const runRow = this.sql
+        .exec("SELECT key_id FROM agent_runs WHERE run_id = ?", targetRunId.trim())
+        .toArray();
+      if (runRow.length > 0) {
+        const pinnedKeyId = Number(runRow[0].key_id);
+        const pinned = this.sql
+          .exec("SELECT * FROM api_keys WHERE id = ? AND enabled = 1", pinnedKeyId)
+          .toArray();
+        if (pinned.length > 0 && !excludeIds.includes(pinnedKeyId)) {
+          const chosen = pinned[0];
+          this.inFlight.set(pinnedKeyId, (this.inFlight.get(pinnedKeyId) || 0) + 1);
+          const nowIso = new Date().toISOString();
+          this.sql.exec(
+            "UPDATE api_keys SET total_calls = total_calls + 1, last_used_at = ? WHERE id = ?",
+            nowIso,
+            chosen.id
+          );
+          return { ...chosen, total_calls: (Number(chosen.total_calls) || 0) + 1 };
+        }
+      }
+    }
 
     const strategy = this.getSetting("strategy", "least_used");
     const allEligible = this.sql
